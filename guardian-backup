@@ -7,6 +7,7 @@ set -uo pipefail
 
 GUARDIAN_ENV="${GUARDIAN_ENV:-/etc/pbs-backup/guardian.env}"
 if [ -f "$GUARDIAN_ENV" ]; then
+  # shellcheck source=/dev/null
   source "$GUARDIAN_ENV"
 fi
 

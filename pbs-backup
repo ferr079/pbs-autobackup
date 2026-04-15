@@ -16,6 +16,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   echo "Copy pbs-backup.env.example to $CONFIG_FILE and edit it."
   exit 2
 fi
+# shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
 # Validate required variables

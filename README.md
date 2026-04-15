@@ -1,5 +1,7 @@
 # pbs-autobackup
 
+[![ShellCheck](https://github.com/ferr079/pbs-autobackup/actions/workflows/lint.yml/badge.svg)](https://github.com/ferr079/pbs-autobackup/actions/workflows/lint.yml)
+
 Automated Proxmox Backup Server orchestration with Wake-on-LAN. Designed for homelabs where the backup server runs on a dedicated machine that stays powered off until needed.
 
 ## What it does
