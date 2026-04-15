@@ -1,0 +1,234 @@
+#!/bin/bash
+# pbs-backup — Orchestrate full Proxmox Backup Server cycle with Wake-on-LAN
+#
+# Flow: WOL → wait boot → enable storage → backup all nodes → wait → prune → GC → disable → shutdown
+# Exit codes: 0=success, 1=partial (some backups failed), 2=critical (PBS host unreachable)
+#
+# Usage: pbs-backup [--dry-run]
+# Config: /etc/pbs-backup/pbs-backup.env (or PBS_BACKUP_ENV override)
+
+set -uo pipefail
+
+# Load config
+CONFIG_FILE="${PBS_BACKUP_ENV:-/etc/pbs-backup/pbs-backup.env}"
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "ERROR: Config file not found: $CONFIG_FILE"
+  echo "Copy pbs-backup.env.example to $CONFIG_FILE and edit it."
+  exit 2
+fi
+source "$CONFIG_FILE"
+
+# Validate required variables
+for var in PBS_HOST_MAC PBS_HOST_IP PBS_IP PBS_STORAGE PVE_NODES; do
+  if [ -z "${!var:-}" ]; then
+    echo "ERROR: Required variable $var is not set in $CONFIG_FILE"
+    exit 2
+  fi
+done
+
+# Defaults
+BACKUP_MODE="${BACKUP_MODE:-snapshot}"
+COMPRESS="${COMPRESS:-zstd}"
+MAX_BOOT_WAIT="${MAX_BOOT_WAIT:-180}"
+MAX_TASK_WAIT="${MAX_TASK_WAIT:-3600}"
+PBS_PRUNE_JOB="${PBS_PRUNE_JOB:-}"
+PBS_DATASTORE="${PBS_DATASTORE:-}"
+DRY_RUN=false
+
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=true
+
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+err() { echo "[$(date '+%H:%M:%S')] ERROR: $*" >&2; }
+
+# Build PVE API URL from first node (used for storage enable/disable)
+FIRST_NODE_IP=$(echo "$PVE_NODES" | cut -d'|' -f2 | head -1)
+FIRST_NODE_TOKEN=$(echo "$PVE_NODES" | head -1 | cut -d'|' -f3)
+
+cleanup() {
+  log "Cleanup: disabling PBS storage on PVE..."
+  pve_api PUT "https://${FIRST_NODE_IP}:8006/api2/json/storage/${PBS_STORAGE}" "$FIRST_NODE_TOKEN" "disable=1" > /dev/null 2>&1 || true
+  log "Cleanup: shutting down PBS host..."
+  ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@${PBS_HOST_IP} "shutdown -h now" 2>/dev/null || true
+  log "Cleanup done."
+}
+
+pve_api() {
+  local method="$1" url="$2" token="$3" data="${4:-}"
+  if [ -n "$data" ]; then
+    curl -sk -X "$method" "$url" -H "Authorization: PVEAPIToken=${token}" -d "$data" 2>/dev/null
+  else
+    curl -sk -X "$method" "$url" -H "Authorization: PVEAPIToken=${token}" 2>/dev/null
+  fi
+}
+
+# --- Step 1: Wake PBS host ---
+log "Step 1: Waking PBS host (${PBS_HOST_MAC})..."
+if $DRY_RUN; then
+  log "[DRY-RUN] Would send WOL packet"
+else
+  wakeonlan "$PBS_HOST_MAC" > /dev/null 2>&1
+fi
+
+# --- Step 2: Wait for PBS host to boot ---
+log "Step 2: Waiting for PBS host to boot (max ${MAX_BOOT_WAIT}s)..."
+if ! $DRY_RUN; then
+  elapsed=0
+  while [ $elapsed -lt $MAX_BOOT_WAIT ]; do
+    if ping -c 1 -W 2 "$PBS_HOST_IP" > /dev/null 2>&1; then
+      log "PBS host responding to ping after ${elapsed}s"
+      sleep 10
+      if curl -sk --max-time 5 "https://${PBS_IP}:8007/api2/json/version" > /dev/null 2>&1; then
+        log "PBS API is up"
+        break
+      fi
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  if [ $elapsed -ge $MAX_BOOT_WAIT ]; then
+    err "PBS host did not boot within ${MAX_BOOT_WAIT}s"
+    exit 2
+  fi
+fi
+
+# --- Step 3: Enable PBS storage ---
+log "Step 3: Enabling storage ${PBS_STORAGE}..."
+if ! $DRY_RUN; then
+  result=$(pve_api PUT "https://${FIRST_NODE_IP}:8006/api2/json/storage/${PBS_STORAGE}" "$FIRST_NODE_TOKEN" "disable=0")
+  if ! echo "$result" | python3 -c "import sys,json; json.load(sys.stdin)" > /dev/null 2>&1; then
+    err "Failed to enable storage"
+    cleanup
+    exit 2
+  fi
+  log "Storage enabled"
+  sleep 5
+fi
+
+# --- Step 4: Run backups on all nodes ---
+task_ids=()
+backup_ok=0
+backup_fail=0
+
+while IFS='|' read -r nname nip ntoken; do
+  [ -z "$nname" ] && continue
+  log "Step 4: Starting backup on ${nname}..."
+
+  if $DRY_RUN; then
+    log "[DRY-RUN] Would start vzdump --all on ${nname}"
+    continue
+  fi
+
+  result=$(pve_api POST "https://${nip}:8006/api2/json/nodes/${nname}/vzdump" "$ntoken" "all=1&storage=${PBS_STORAGE}&mode=${BACKUP_MODE}&compress=${COMPRESS}&prune-backups=keep-weekly%3D5%2Ckeep-last%3D1")
+  upid=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'])" 2>/dev/null) || true
+
+  if [ -z "$upid" ]; then
+    err "Failed to start backup on ${nname}: $result"
+    backup_fail=$((backup_fail + 1))
+    continue
+  fi
+
+  log "${nname}: backup started (UPID: ${upid})"
+  task_ids+=("${nname}|${nip}|${ntoken}|${upid}")
+done <<< "$PVE_NODES"
+
+# --- Step 5: Wait for all backups to complete ---
+if [ ${#task_ids[@]} -gt 0 ] && ! $DRY_RUN; then
+  log "Step 5: Waiting for backups to complete (max ${MAX_TASK_WAIT}s)..."
+  elapsed=0
+
+  while [ ${#task_ids[@]} -gt 0 ] && [ $elapsed -lt $MAX_TASK_WAIT ]; do
+    remaining=()
+    for entry in "${task_ids[@]}"; do
+      IFS='|' read -r nname nip ntoken upid <<< "$entry"
+      encoded_upid=$(echo "$upid" | sed 's/:/%3A/g')
+      status=$(pve_api GET "https://${nip}:8006/api2/json/nodes/${nname}/tasks/${encoded_upid}/status" "$ntoken")
+      task_status=$(echo "$status" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['status'])" 2>/dev/null) || true
+
+      case "$task_status" in
+        stopped)
+          exit_status=$(echo "$status" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'].get('exitstatus','unknown'))" 2>/dev/null) || true
+          if [ "$exit_status" = "OK" ]; then
+            log "${nname}: backup completed OK"
+            backup_ok=$((backup_ok + 1))
+          else
+            err "${nname}: backup finished with status: ${exit_status}"
+            backup_fail=$((backup_fail + 1))
+          fi
+          ;;
+        running)
+          remaining+=("$entry")
+          ;;
+        *)
+          log "${nname}: task status=${task_status}, still waiting..."
+          remaining+=("$entry")
+          ;;
+      esac
+    done
+    task_ids=("${remaining[@]+"${remaining[@]}"}")
+
+    if [ ${#task_ids[@]} -gt 0 ]; then
+      sleep 30
+      elapsed=$((elapsed + 30))
+    fi
+  done
+
+  if [ ${#task_ids[@]} -gt 0 ]; then
+    err "Timeout: ${#task_ids[@]} backups still running after ${MAX_TASK_WAIT}s"
+    backup_fail=$((backup_fail + ${#task_ids[@]}))
+  fi
+fi
+
+# --- Step 6: Prune old snapshots on PBS ---
+if [ -n "$PBS_PRUNE_JOB" ]; then
+  log "Step 6: Running prune job '${PBS_PRUNE_JOB}' on PBS..."
+  if ! $DRY_RUN; then
+    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@"$PBS_IP" \
+      "proxmox-backup-manager prune-job run ${PBS_PRUNE_JOB}" 2>&1 || true
+    log "Prune done"
+  fi
+else
+  log "Step 6: No prune job configured, skipping"
+fi
+
+# --- Step 7: Garbage collection on PBS ---
+if [ -n "$PBS_DATASTORE" ]; then
+  log "Step 7: Running garbage collection on datastore '${PBS_DATASTORE}'..."
+  if ! $DRY_RUN; then
+    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@"$PBS_IP" \
+      "proxmox-backup-manager garbage-collection start ${PBS_DATASTORE}" 2>&1 || true
+    sleep 30
+    log "GC done"
+  fi
+else
+  log "Step 7: No datastore configured for GC, skipping"
+fi
+
+# --- Step 8: Disable PBS storage ---
+log "Step 8: Disabling storage ${PBS_STORAGE}..."
+if ! $DRY_RUN; then
+  pve_api PUT "https://${FIRST_NODE_IP}:8006/api2/json/storage/${PBS_STORAGE}" "$FIRST_NODE_TOKEN" "disable=1" > /dev/null 2>&1
+  log "Storage disabled"
+fi
+
+# --- Step 9: Shutdown PBS host ---
+log "Step 9: Shutting down PBS host..."
+if ! $DRY_RUN; then
+  ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@${PBS_HOST_IP} "shutdown -h now" 2>/dev/null || true
+  log "PBS host shutdown initiated"
+fi
+
+# --- Summary ---
+echo ""
+echo "=== PBS BACKUP SUMMARY ==="
+echo "Backups OK:     ${backup_ok}"
+echo "Backups FAILED: ${backup_fail}"
+if $DRY_RUN; then
+  echo "Mode: DRY-RUN (no actions taken)"
+fi
+
+if [ "$backup_fail" -gt 0 ]; then
+  exit 1
+else
+  exit 0
+fi

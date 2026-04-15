@@ -1,0 +1,56 @@
+#!/bin/bash
+# guardian-backup — Wrapper for pbs-backup with Telegram alerts
+# Cron example: 0 3 * * 0 /usr/local/bin/guardian-backup
+# Config: /etc/pbs-backup/guardian.env
+
+set -uo pipefail
+
+GUARDIAN_ENV="${GUARDIAN_ENV:-/etc/pbs-backup/guardian.env}"
+if [ -f "$GUARDIAN_ENV" ]; then
+  source "$GUARDIAN_ENV"
+fi
+
+if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+  echo "ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set"
+  echo "Set them in $GUARDIAN_ENV"
+  exit 1
+fi
+
+LOG_DIR="${GUARDIAN_LOG_DIR:-/var/log/guardian-backup}"
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_DIR}/backup-$(date '+%Y-%m-%d').log"
+LOG_RETENTION="${GUARDIAN_LOG_RETENTION:-90}"
+
+timestamp=$(date '+%Y-%m-%d %H:%M')
+
+rc=0
+output=$(pbs-backup 2>&1) || rc=$?
+
+echo "[$timestamp] exit=$rc" > "$LOG_FILE"
+echo "$output" >> "$LOG_FILE"
+
+summary=$(echo "$output" | grep -A3 '=== PBS BACKUP SUMMARY ===' || echo "No summary available")
+
+if [ "$rc" -eq 0 ]; then
+  emoji="✅"; level="SUCCESS"
+elif [ "$rc" -eq 1 ]; then
+  emoji="⚠️"; level="PARTIAL FAILURE"
+else
+  emoji="🚨"; level="CRITICAL FAILURE"
+fi
+
+message="${emoji} GUARDIAN BACKUP — ${level}
+
+${summary}
+${timestamp}
+
+Log: ${LOG_FILE}"
+
+curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${TELEGRAM_CHAT_ID}" \
+  -d "text=${message}" \
+  -d "parse_mode=HTML" > /dev/null 2>&1
+
+find "$LOG_DIR" -name "*.log" -mtime +${LOG_RETENTION} -delete 2>/dev/null || true
+
+exit $rc
