@@ -71,9 +71,9 @@ Copy `pbs-backup.env.example` to `/etc/pbs-backup/pbs-backup.env`:
 
 ```bash
 # One line per node: name|ip|api_token
-PVE_NODES="pve1|192.168.1.251|user@pam!backup=xxx-xxx
-pve2|192.168.1.252|user@pam!backup=yyy-yyy
-pve3|192.168.1.253|user@pam!backup=zzz-zzz"
+PVE_NODES="pve1|10.0.0.11|user@pam!backup=xxx-xxx
+pve2|10.0.0.12|user@pam!backup=yyy-yyy
+pve3|10.0.0.13|user@pam!backup=zzz-zzz"
 ```
 
 ## Telegram alerts (optional)
